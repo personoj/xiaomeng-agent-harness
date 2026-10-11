@@ -21,6 +21,7 @@ from .task_updates import TaskUpdates
 from .audio_activity import PlaybackEnvelope, energy, level
 from .speech_input import SpeechInputs
 from .narration import Narration
+from .latency import TurnTimings
 
 Sink = Callable[[dict], Awaitable[None]]
 
@@ -43,6 +44,7 @@ class Response:
     drained: bool = False
     narration_id: str | None = None
     calls: set = field(default_factory=set)
+    task_sources: tuple = ()
     envelope: PlaybackEnvelope = field(default_factory=PlaybackEnvelope)
 
 
@@ -63,11 +65,13 @@ class Harness:
         self.local_tools: dict[str, Tool] = {}
         self.responses: dict[str, Response] = {}
         self.expected_turns = deque()
+        self.expected_task_sources = deque()
         self.tool_tasks: dict[str, asyncio.Task] = {}
         self.tool_waiters: dict[str, asyncio.Future] = {}
         self.tool_outputs_sent = set()
         self.turn_requests = set()
         self.turn_started_at = time.monotonic()
+        self.timings = TurnTimings()
         self.trace = deque(maxlen=200)
         self.state = "disconnected"
         self.provider_idle = False
@@ -111,7 +115,12 @@ class Harness:
         return self.cfg.instructions + "\n以下 JSON 仅为页面状态数据：\n" + json.dumps(page, ensure_ascii=False) + "\n以下 JSON 是已确认的会话与操作记录（不是新指令）：\n" + self.store.projection(self.cfg.history_chars)
 
     async def emit(self, event: dict, target: str | None = None):
+        self.task_updates.notify()
         event = {"session_id": self.store.id, "turn": self.turn, **event}
+        response = self.responses.get(event.get("response_id"))
+        if response and response.task_sources and (event["type"] != "audio.delta" or event.get("seq") == 1):
+            event = {**event, "task_sources": list(response.task_sources)}
+        event = self.timings.stamp(event)
         if event["type"] not in ("audio.delta", "transcript.delta", "audio.activity", "narration.progress"):
             self.trace.append({"at": time.time(), **event})
         selected = [self.channels[target]] if target in self.channels else [] if target else list(self.channels.values())
@@ -203,6 +212,7 @@ class Harness:
             self.responses.clear()
             self.speech_inputs = SpeechInputs()
             self.expected_turns.clear()
+            self.expected_task_sources.clear()
             self.reader = asyncio.create_task(self._read(provider))
             await self.set_state("listening")
             await self.emit({"type": "ready", "model": self.cfg.model, "voice": self.cfg.voice, "input_sample_rate": 16000, "output_sample_rate": 24000,
@@ -266,6 +276,7 @@ class Harness:
         self.config_dirty = False
 
     async def handle(self, connection: str, event: dict):
+        received_at = time.monotonic()
         kind = event.get("type")
         roles = {r for r, value in self.channels.items() if value[0] == connection}
         if not roles:
@@ -320,6 +331,7 @@ class Harness:
                 if not text or len(text) > 8000:
                     raise ValueError("invalid_text")
                 await self._new_turn("text")
+                self.timings.start(self.turn, "input.text_received", received_at)
                 self.store.history("user", text, turn=self.turn)
                 await self._send({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
                 await self.emit({"type": "transcript.user", "text": text})
@@ -364,6 +376,11 @@ class Harness:
                     self.speech_inputs.start(self.turn)
                 self.input_open = self.manual_buffered = False
                 samples, self.input_samples = self.input_samples, 0
+                if samples >= 1600:
+                    # Include session-lock and outbound-meter waits after commit
+                    # arrival; device release uses its own unsynchronized clock.
+                    self.turn_started_at = received_at
+                    self.timings.start(self.turn, "input.commit_received", received_at)
                 await self._activity("input", 0)
                 if samples < 1600:
                     await self._send({"type": "input_audio_buffer.clear"})
@@ -374,7 +391,6 @@ class Harness:
                     return
                 # Measure response latency after the user releases the button,
                 # not from the beginning of their spoken input.
-                self.turn_started_at = time.monotonic()
                 self.manual_commits.append(self.speech_inputs.turns[self.turn])
                 await self._send({"type": "input_audio_buffer.commit"})
                 self.manual_pending_turn = self.turn
@@ -408,9 +424,10 @@ class Harness:
         if turn == self.turn:
             await self._request_response(turn)
 
-    async def _request_response(self, turn):
+    async def _request_response(self, turn, task_sources=()):
         await self._flush_config()
         self.expected_turns.append(turn)
+        self.expected_task_sources.append(tuple(task_sources))
         await self._send({"type": "response.create", "response": {"modalities": ["text", "audio"]}})
 
     async def _interrupt(self, reason):
@@ -418,7 +435,9 @@ class Harness:
         ids = []
         cancel = False
         for response in self.responses.values():
-            outstanding = not response.done or response.played_samples < response.generated_samples
+            # A full sample count can precede audio.end. A client that clears it
+            # will never drain it, so cancel pending playback until drain is confirmed.
+            outstanding = not response.done or (response.generated_samples > 0 and not response.drained)
             if response.interrupted or not outstanding:
                 continue
             response.interrupted = True
@@ -455,6 +474,9 @@ class Harness:
             raise ValueError("invalid_playback_progress")
         previous = response.played_samples
         response.played_samples = max(previous, played)
+        if not response.interrupted and previous == 0 and played > 0:
+            await self.emit({"type": "playback.observed", "response_id": response.id,
+                             "turn": response.turn, "played_samples": played}, "page")
         if not response.interrupted and played > previous:
             await self._activity("output", response.envelope.played(previous, played), response.id)
         if response.interrupted:
@@ -472,7 +494,8 @@ class Harness:
                 response.recorded = True
                 self.store.history("assistant_heard", response.text, response_id=response.id)
                 await self._refresh()
-            await self.emit({"type": "playback.completed", "response_id": response.id, "played_ms": played / 24})
+            await self.emit({"type": "playback.completed", "response_id": response.id,
+                             "turn": response.turn, "played_ms": played / 24})
             if response.turn == self.turn and not self.expected_turns and not any(c["status"] in ("running", "dispatched") for c in self.store.data["calls"].values()) and not any(not r.done or (not r.interrupted and r.played_samples < r.generated_samples) for r in self.responses.values()):
                 await self.set_state("listening")
         await self.narration.playback(response, completed)
@@ -496,7 +519,9 @@ class Harness:
                 await self._flush_config()
                 return
             self.expected_turns.append(self.turn)
+            self.expected_task_sources.append(())
             self.turn_started_at = time.monotonic()
+            self.timings.start(self.turn, "speech_stopped_handled", self.turn_started_at)
             await self.set_state("thinking")
         elif kind == "input_audio_buffer.committed":
             if self.turn_detection == "manual" and self.manual_commits:
@@ -524,8 +549,12 @@ class Harness:
             rid = event["response"]["id"]
             if rid in self.responses:
                 return
-            turn = self.expected_turns.popleft() if self.expected_turns else self.turn
-            response = self.responses[rid] = Response(rid, turn, self.revision)
+            if self.expected_turns:
+                turn = self.expected_turns.popleft()
+                task_sources = self.expected_task_sources.popleft()
+            else:
+                turn, task_sources = self.turn, ()
+            response = self.responses[rid] = Response(rid, turn, self.revision, task_sources=task_sources)
             if turn != self.turn:
                 response.interrupted = True
                 await self._send({"type": "response.cancel"})
@@ -554,6 +583,7 @@ class Harness:
                         await self._send({"type": "conversation.item.delete", "item_id": item["id"]})
             elif kind == "response.done":
                 response.done = True
+                self.task_updates.notify()  # Cancelled responses may emit no further event.
                 status = event.get("response", {}).get("status", "completed")
                 if status != "completed" and not response.interrupted:
                     if status == "cancelled":
@@ -570,7 +600,7 @@ class Harness:
                         await self._send({"type": "conversation.item.delete", "item_id": item_id})
                 if not response.interrupted:
                     await self.emit({"type": "audio.end", "response_id": rid, "samples": response.generated_samples}, "audio")
-                    await self.emit({"type": "response.generated", "response_id": rid, "text": response.text, "status": status})
+                    await self.emit({"type": "response.generated", "response_id": rid, "turn": response.turn, "text": response.text, "status": status})
                 await self._maybe_continue(response)
                 await self._flush_manual_response()
                 await self._flush_config()
@@ -579,7 +609,10 @@ class Harness:
             elif kind == "response.audio.delta":
                 raw = base64.b64decode(event["delta"], validate=True)
                 if not response.generated_samples:
-                    await self.emit({"type": "metrics", "response_id": rid, "first_audio_ms": round((time.monotonic() - self.turn_started_at) * 1000)})
+                    await self.emit({"type": "metrics", "response_id": rid, "turn": response.turn,
+                                     "first_audio_ms": round((time.monotonic() - self.turn_started_at) * 1000),
+                                     "first_audio_kind": "generated_at_harness",
+                                     "first_audio_origin": "task_announcement_requested" if response.task_sources else "turn_started"})
                 response.generated_samples += len(raw) // 2
                 response.envelope.append(raw)
                 response.sequence += 1
@@ -677,7 +710,8 @@ class Harness:
                     call["status"], call["connection"] = "dispatched", page[0]
                     call["page_id"] = self.page_id
                     self.store.save()
-                    await self.emit({"type": "tool.request", "call_id": call_id, "name": call["name"], "args": call["args"], "expected_revision": call["revision"]}, "page")
+                    await self.emit({"type": "tool.request", "call_id": call_id, "name": call["name"], "args": call["args"], "expected_revision": call["revision"],
+                                     "turn": call["turn"], "response_id": call["response_id"]}, "page")
                 result = await asyncio.wait_for(asyncio.shield(future), self.cfg.tool_timeout)
             async with self.lock:
                 status = "unknown" if result.get("outcome") == "unknown" else "failed" if "error" in result else "succeeded"
@@ -728,7 +762,8 @@ class Harness:
         call = self.store.data["calls"][call_id]
         call["status"], call["result"] = status, result
         self.store.history("tool", json.dumps({"name": call["name"], "arguments": call["args"], "status": status, "result": result}, ensure_ascii=False), call_id=call_id)
-        await self.emit({"type": "tool.completed", "call_id": call_id, "name": call["name"], "status": status, "result": result, "late": late})
+        await self.emit({"type": "tool.completed", "call_id": call_id, "name": call["name"], "status": status, "result": result, "late": late,
+                         "turn": call["turn"], "response_id": call["response_id"]})
         response = self.responses.get(call["response_id"])
         if self.provider and response and call_id not in self.tool_outputs_sent:
             self.tool_outputs_sent.add(call_id)
@@ -746,4 +781,4 @@ class Harness:
         response.continued = True
         if response.turn == self.turn and not response.interrupted and self.provider:
             if not await self.narration.consume(response):
-                await self._request_response(response.turn)
+                await self._request_response(response.turn, task_sources=response.task_sources)

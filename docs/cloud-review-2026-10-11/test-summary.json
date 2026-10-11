@@ -1,0 +1,10 @@
+{
+  "reviewed_local_head": "3bcec5d5a66f33c34e22e1f337416d974707b5d1",
+  "baseline": "a2f2405491637868eb647c7d06a6307c16efc50b",
+  "code_tests": "unchanged reviewed code; this supplemental commit adds only public synthetic evidence",
+  "remote_publication": "draft PR only; no merge or deployment",
+  "browser_gpu_hardware_model_acceptance": "not completed",
+  "python_passed": 67,
+  "node_passed": 13,
+  "cross_repo_sdk": "9 injected-await-boundary cases pass; baseline SDK fails all9"
+}

@@ -5,6 +5,7 @@ export class VoiceClient extends EventTarget {
     Object.assign(this, { baseURL, sessionId, role });
     this.actions = new Map(); this.completed = new Map(); this.playing = new Map();
     this.cancelled = new Set(); this.revision = 0; this.context = {};
+    this.turn = null; this.transportGeneration = 0; this.intentGeneration = 0;
     this.actionChain = Promise.resolve(); this.nextAt = 0;
   }
   notify(event) { this.dispatchEvent(new CustomEvent('event', { detail: event })); }
@@ -21,33 +22,43 @@ export class VoiceClient extends EventTarget {
     await this.audio.resume();
   }
   async connect() {
+    const generation = ++this.transportGeneration;
+    this.turn = null;
     const response = await fetch(`${this.baseURL}/api/sessions`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: this.sessionId }),
     });
     if (!response.ok) throw new Error('创建会话失败');
-    const data = await response.json(); this.sessionId = data.session_id;
+    const data = await response.json();
+    if (generation !== this.transportGeneration) throw new Error('连接已取消');
+    this.sessionId = data.session_id;
     const url = new URL(`/ws/${this.sessionId}?role=${this.role}`, this.baseURL);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    this.ws = new WebSocket(url);
+    const socket = this.ws = new WebSocket(url);
     let resolveAttached, rejectAttached, attached=false;
     const attachment = new Promise((resolve,reject)=>{resolveAttached=resolve;rejectAttached=reject;});
     const deadline=setTimeout(()=>rejectAttached(new Error('会话通道连接超时')),10000);
-    this.ws.onerror=()=>rejectAttached(new Error('连接本地服务失败'));
-    this.ws.onmessage = ({ data }) => {
+    socket.onerror=()=>rejectAttached(new Error('连接本地服务失败'));
+    socket.onmessage = ({ data }) => {
+      if (generation !== this.transportGeneration) return;
       const event = JSON.parse(data);
       if(event.type==='attached'){attached=true;resolveAttached();}
       if(event.type==='error'&&!attached)rejectAttached(new Error(event.message||event.code));
       this.receive(event).catch(error => this.notify({ type: 'error', message: error.message }));
     };
-    this.ws.onclose = () => {
+    socket.onclose = () => {
       if(!attached)rejectAttached(new Error('会话通道未能连接'));
+      if (generation !== this.transportGeneration) return;
+      this.transportGeneration++;
       this.stopMic(); this.clearAudio([...this.playing.keys()], false);
       clearInterval(this.progressTimer);
       this.notify({ type: 'state', state: 'disconnected' });
       this.notify({ type: 'transport.closed' });
     };
-    try{await attachment;}catch(error){this.ws.close();throw error;}finally{clearTimeout(deadline);}
+    try{
+      await attachment;
+      if (generation !== this.transportGeneration) throw new Error('连接已取消');
+    }catch(error){socket.close();throw error;}finally{clearTimeout(deadline);}
     this.progressTimer = setInterval(() => this.reportProgress(), 100);
     return this.sessionId;
   }
@@ -145,12 +156,19 @@ export class VoiceClient extends EventTarget {
     this.nextAt = this.audio?.currentTime || 0;
   }
   async receive(event) {
+    // Late durable tool results may carry an older turn. They must not make a
+    // superseded intent current again, even if the page revision is unchanged.
+    if (Number.isInteger(event.turn)) this.turn = Math.max(this.turn ?? event.turn, event.turn);
     if (event.type === 'ready') this.modelReady = true;
-    if (event.type === 'state' && ['disconnected', 'error'].includes(event.state)) { this.modelReady = false; this.stopMic(); }
+    if (event.type === 'state' && ['disconnected', 'error'].includes(event.state)) {
+      // Session stop can leave the page WebSocket open and the turn unchanged.
+      this.intentGeneration++; this.modelReady = false; this.stopMic();
+    }
     if (event.revision !== undefined) this.revision = event.revision;
     if (event.type === 'context.updated') this.context = event.context;
     if (event.type === 'tool.request') {
-      this.actionChain = this.actionChain.then(() => this.execute(event)).catch(error => this.notify({ type: 'error', message: error.message }));
+      const generation = this.transportGeneration, turn = event.turn ?? this.turn, intent = this.intentGeneration;
+      this.actionChain = this.actionChain.then(() => this.execute(event, generation, turn, intent)).catch(error => this.notify({ type: 'error', message: error.message }));
     } else if (event.type === 'audio.clear') {
       this.clearAudio(event.response_ids);
     } else if (event.type === 'audio.delta' && !this.cancelled.has(event.response_id)) {
@@ -177,32 +195,49 @@ export class VoiceClient extends EventTarget {
     }
     this.notify(event);
   }
-  async execute(request) {
+  async execute(request, generation = this.transportGeneration, turn = request.turn ?? this.turn, intent = this.intentGeneration) {
     const { call_id, name, args, expected_revision } = request;
-    if (this.completed.has(call_id)) { this.send(this.completed.get(call_id)); return; }
+    if (this.completed.has(call_id)) {
+      if (generation === this.transportGeneration) this.send(this.completed.get(call_id));
+      return;
+    }
     const action = this.actions.get(name);
+    const isCurrent = () => this.revision === expected_revision
+      && generation === this.transportGeneration && turn === this.turn
+      && intent === this.intentGeneration && !this.cancelled.has(request.response_id);
     let reply;
-    if (!action || this.revision !== expected_revision) {
-      reply = { type: 'tool.result', call_id, result: { error: action ? 'page_context_changed' : 'unknown_tool' } };
+    if (!action || !isCurrent()) {
+      const error = !action ? 'unknown_tool' : generation !== this.transportGeneration
+        ? 'transport_expired' : turn !== this.turn ? 'turn_superseded'
+        : intent !== this.intentGeneration ? 'session_stopped'
+        : this.cancelled.has(request.response_id) ? 'response_cancelled' : 'page_context_changed';
+      reply = { type: 'tool.result', call_id, result: { error } };
     } else {
       try {
         const output = await action.execute(args, {
           callId: call_id, contextAtStart: structuredClone(this.context),
-          isCurrent: () => this.revision === expected_revision,
+          isCurrent,
         });
         reply = { type: 'tool.result', call_id, result: output?.result ?? output ?? {} };
-        if (output?.context && this.revision === expected_revision) {
+        if (output?.context && isCurrent()) {
           reply.context = output.context; this.context = output.context; this.revision++;
         }
       } catch {
         reply = { type: 'tool.result', call_id, result: { error: 'page_action_failed', outcome: 'unknown' } };
       }
     }
-    this.completed.set(call_id, reply); this.send(reply);
+    // Preserve the outcome of an already-submitted mutation, but never send an
+    // old transport's result through a replacement connection.
+    this.completed.set(call_id, reply);
+    if (generation === this.transportGeneration) this.send(reply);
   }
   disconnect() {
+    this.transportGeneration++;
     this.stopMic(); this.clearAudio([...this.playing.keys()]);
     clearInterval(this.progressTimer); this.ws?.close();
     this.audio?.close();
+    this.modelReady = false;
+    this.notify({ type: 'state', state: 'disconnected' });
+    this.notify({ type: 'transport.closed' });
   }
 }

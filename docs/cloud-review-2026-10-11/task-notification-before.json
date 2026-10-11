@@ -1,0 +1,93 @@
+{
+  "scope": "synthetic offline Harness scheduler only; not device/model/E2E latency",
+  "repo": "[cloud-workspace]/baselines/xiaoyun-realtime",
+  "python": "3.12.14",
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "samples": 20,
+  "p50_ms": 65.3585,
+  "p95_ms": 95.362,
+  "p99_ms": 95.367,
+  "max_ms": 95.367,
+  "trials": [
+    {
+      "injected_delay_ms": 5,
+      "receipt_to_request_ms": 95.362
+    },
+    {
+      "injected_delay_ms": 20,
+      "receipt_to_request_ms": 80.397
+    },
+    {
+      "injected_delay_ms": 50,
+      "receipt_to_request_ms": 50.31
+    },
+    {
+      "injected_delay_ms": 90,
+      "receipt_to_request_ms": 10.297
+    },
+    {
+      "injected_delay_ms": 5,
+      "receipt_to_request_ms": 95.335
+    },
+    {
+      "injected_delay_ms": 20,
+      "receipt_to_request_ms": 80.37
+    },
+    {
+      "injected_delay_ms": 50,
+      "receipt_to_request_ms": 50.292
+    },
+    {
+      "injected_delay_ms": 90,
+      "receipt_to_request_ms": 10.254
+    },
+    {
+      "injected_delay_ms": 5,
+      "receipt_to_request_ms": 95.367
+    },
+    {
+      "injected_delay_ms": 20,
+      "receipt_to_request_ms": 80.368
+    },
+    {
+      "injected_delay_ms": 50,
+      "receipt_to_request_ms": 50.324
+    },
+    {
+      "injected_delay_ms": 90,
+      "receipt_to_request_ms": 10.263
+    },
+    {
+      "injected_delay_ms": 5,
+      "receipt_to_request_ms": 95.321
+    },
+    {
+      "injected_delay_ms": 20,
+      "receipt_to_request_ms": 80.328
+    },
+    {
+      "injected_delay_ms": 50,
+      "receipt_to_request_ms": 50.389
+    },
+    {
+      "injected_delay_ms": 90,
+      "receipt_to_request_ms": 10.33
+    },
+    {
+      "injected_delay_ms": 5,
+      "receipt_to_request_ms": 95.338
+    },
+    {
+      "injected_delay_ms": 20,
+      "receipt_to_request_ms": 80.354
+    },
+    {
+      "injected_delay_ms": 50,
+      "receipt_to_request_ms": 50.326
+    },
+    {
+      "injected_delay_ms": 90,
+      "receipt_to_request_ms": 10.283
+    }
+  ]
+}
