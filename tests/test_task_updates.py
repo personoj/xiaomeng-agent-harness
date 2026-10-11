@@ -6,7 +6,7 @@ import pytest
 from xiaoyun.harness import Harness, Response
 from xiaoyun.config import Settings
 from xiaoyun.memory import SessionStore
-from test_harness import FakeProvider
+from test_harness import FakeProvider, flush, model
 
 
 async def ready(tmp_path):
@@ -29,7 +29,8 @@ async def test_completion_waits_for_actual_playback_and_deduplicates(tmp_path):
         await h.handle(connection,event)
         await asyncio.sleep(.15)
         assert not any(e['type']=='response.create' for e in h.provider.sent)
-        h.responses['r1'].played_samples=2400
+        await h.handle(connection, {'type': 'playback.progress', 'response_id': 'r1',
+                                    'played_samples': 2400, 'drained': True})
         await asyncio.sleep(.15)
         assert len([e for e in h.provider.sent if e['type']=='response.create'])==1
         await h.handle(connection,event)
@@ -70,3 +71,72 @@ async def test_completion_while_asleep_is_saved_without_starting_cloud(tmp_path)
     await h.handle(connection,event)
     assert h.provider is None and h.task_updates.pending==[]
     assert any(e['type']=='task.ack' for e in events)
+
+
+async def test_playback_receipt_wakes_announcement_without_polling(tmp_path):
+    h, connection, events, event = await ready(tmp_path)
+    try:
+        h.responses['r1'] = Response('r1', h.turn, h.revision,
+                                    generated_samples=2400, done=True)
+        await h.handle(connection, event)
+        await flush()  # Worker has checked quiet and is now waiting for a transition.
+        assert not any(e['type'] == 'response.create' for e in h.provider.sent)
+        await h.handle(connection, {'type': 'playback.progress', 'response_id': 'r1',
+                                    'played_samples': 2400, 'drained': False})
+        await flush()
+        assert not any(e['type'] == 'response.create' for e in h.provider.sent)
+        await h.handle(connection, {'type': 'playback.progress', 'response_id': 'r1',
+                                    'played_samples': 2400, 'drained': True})
+        await flush()  # No real-time polling interval is advanced.
+        assert len([e for e in h.provider.sent if e['type'] == 'response.create']) == 1
+    finally:
+        await h.stop()
+
+
+async def test_cancelled_response_done_wakes_pending_announcement(tmp_path):
+    h, connection, events, event = await ready(tmp_path)
+    try:
+        h.responses['old'] = Response('old', h.turn, h.revision, interrupted=True)
+        await h.handle(connection, event)
+        await flush()
+        assert not any(e['type'] == 'response.create' for e in h.provider.sent)
+        await model(h, {'type': 'response.done', 'response': {'id': 'old', 'status': 'cancelled'}})
+        await flush()
+        assert len([e for e in h.provider.sent if e['type'] == 'response.create']) == 1
+    finally:
+        await h.stop()
+
+
+async def test_wakeup_preserves_quiet_guard_and_speech_priority(tmp_path):
+    h, connection, events, event = await ready(tmp_path)
+    try:
+        h.turn_started_at = time.monotonic()
+        await h.handle(connection, event)
+        await flush()
+        assert not any(e['type'] == 'response.create' for e in h.provider.sent)
+        h.speech_active = True
+        h.turn_started_at -= 1
+        await h.emit({'type': 'test.transition'})
+        await flush()
+        assert not any(e['type'] == 'response.create' for e in h.provider.sent)
+        h.speech_active = False
+        await h.emit({'type': 'test.transition'})
+        await flush()
+        assert len([e for e in h.provider.sent if e['type'] == 'response.create']) == 1
+    finally:
+        await h.stop()
+
+
+async def test_quiet_guard_has_one_deadline_even_without_protocol_events(tmp_path):
+    h, connection, events, event = await ready(tmp_path)
+    try:
+        h.turn_started_at = time.monotonic() - .48
+        started_at = h.turn_started_at
+        await h.handle(connection, event)
+        await flush()
+        assert not any(e['type'] == 'response.create' for e in h.provider.sent)
+        await asyncio.wait_for(asyncio.shield(h.task_updates.worker), .3)
+        assert time.monotonic() - started_at >= .5
+        assert len([e for e in h.provider.sent if e['type'] == 'response.create']) == 1
+    finally:
+        await h.stop()

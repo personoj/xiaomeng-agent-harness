@@ -9,6 +9,12 @@ class TaskUpdates:
         self.h = harness
         self.pending = []
         self.worker = None
+        self.changed = asyncio.Event()
+
+    def notify(self):
+        # Called by Harness state/protocol transitions, not a playback clock.
+        if self.pending:
+            self.changed.set()
 
     async def accept(self, event):
         h = self.h
@@ -26,7 +32,8 @@ class TaskUpdates:
         if key in saved:
             await h.emit({"type": "task.ack", "task_id": task_id, "duplicate": True}, "page")
             return
-        fact = {"task_id": task_id, "source_call_id": call_id, "page_id": h.page_id, "status": status, "result": result}
+        fact = {"task_id": task_id, "source_call_id": call_id, "source_turn": call.get("turn", h.turn),
+                "page_id": h.page_id, "status": status, "result": result}
         saved[key] = fact
         h.store.history("task_result", json.dumps(fact, ensure_ascii=False), task_id=task_id)
         await h._refresh()
@@ -44,13 +51,17 @@ class TaskUpdates:
                 and h.manual_pending_turn is None and not h.expected_turns
                 and time.monotonic() - h.turn_started_at >= .5
                 and not any(c["status"] in ("running", "dispatched") for c in h.store.data["calls"].values())
-                and not any(not r.done or (not r.interrupted and r.played_samples < r.generated_samples) for r in h.responses.values()))
+                and not any(not r.done or (not r.interrupted and r.generated_samples and not r.drained)
+                            for r in h.responses.values()))
 
     async def _deliver(self):
         h = self.h
         try:
             while self.pending:
                 async with h.lock:
+                    # Clear before checking under the same lock as state changes:
+                    # a transition after this check must wake the waiter.
+                    self.changed.clear()
                     if not h.provider or "audio" not in h.channels:
                         self.pending.clear()
                         return
@@ -65,10 +76,20 @@ class TaskUpdates:
                                 "请用一句简短中文报告真实结果；不要重新执行操作，也不要把失败说成成功。\n"
                                 + json.dumps(facts, ensure_ascii=False)}]}})
                         h.turn_started_at = time.monotonic()
-                        await h._request_response(h.turn)
-                        await h.emit({"type": "task.announcing", "task_ids": [f["task_id"] for f in facts]})
+                        sources = [{key: fact[key] for key in ('task_id', 'source_call_id', 'source_turn')}
+                                   for fact in facts]
+                        await h._request_response(h.turn, task_sources=sources)
+                        await h.emit({"type": "task.announcing", "task_ids": [f["task_id"] for f in facts],
+                                      "task_sources": sources})
                         return
-                await asyncio.sleep(.1)
+                    quiet_delay = .5 - (time.monotonic() - h.turn_started_at)
+                if quiet_delay > 0:
+                    try:
+                        await asyncio.wait_for(self.changed.wait(), quiet_delay)
+                    except asyncio.TimeoutError:
+                        pass  # Only the existing quiet-boundary guard elapsed.
+                else:
+                    await self.changed.wait()
         except asyncio.CancelledError:
             pass
         except Exception:
