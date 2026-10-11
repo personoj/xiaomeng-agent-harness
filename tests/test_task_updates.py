@@ -6,16 +6,16 @@ import pytest
 from xiaoyun.harness import Harness, Response
 from xiaoyun.config import Settings
 from xiaoyun.memory import SessionStore
-from test_harness import FakeProvider, flush, model
+from test_harness import FakeProvider, audio, done, flush, model, response
 
 
-async def ready(tmp_path):
+async def ready(tmp_path, *, input_mode=None):
     h=Harness(Settings(data_dir=tmp_path),SessionStore(tmp_path),FakeProvider)
     events=[]
     async def sink(e):events.append(e)
     connection=await h.attach('duplex',sink)
     await h.handle(connection,{'type':'context.update','page_id':'demo','context':{}})
-    await h.start()
+    await h.start(input_mode)
     h.turn_started_at=time.monotonic()-1
     h.store.data['calls']['c1']={'status':'succeeded','page_id':'demo','result':{'task_id':'job1'}}
     event={'type':'task.update','task_id':'job1','source_call_id':'c1','status':'succeeded','result':{'success':True}}
@@ -89,6 +89,79 @@ async def test_playback_receipt_wakes_announcement_without_polling(tmp_path):
                                     'played_samples': 2400, 'drained': True})
         await flush()  # No real-time polling interval is advanced.
         assert len([e for e in h.provider.sent if e['type'] == 'response.create']) == 1
+    finally:
+        await h.stop()
+
+
+@pytest.mark.parametrize('interrupt_event', [
+    {'type': 'interrupt'},
+    {'type': 'input.begin'},
+], ids=['browser-interrupt', 'button-begin'])
+async def test_full_sample_interruption_releases_notifications_without_false_drain(tmp_path, interrupt_event):
+    h, connection, events, task_event = await ready(tmp_path, input_mode='push_to_talk')
+    try:
+        await h.handle(connection, {'type': 'input.text', 'text': 'synthetic command'})
+        await response(h, 'old')
+        await model(h, {'type': 'response.audio_transcript.done', 'response_id': 'old',
+                        'transcript': 'synthetic interrupted answer'})
+        await audio(h, 'old')
+        await done(h, 'old')
+        # The client has played all PCM while audio.end is still in transit.
+        # VoiceClient.clearAudio reports this count, then removes its playback entry.
+        await h.handle(connection, {'type': 'playback.progress', 'response_id': 'old',
+                                    'played_samples': 2400, 'drained': False})
+        old = h.responses['old']
+        h.turn_started_at = time.monotonic() - 1
+        requested = sum(e['type'] == 'response.create' for e in h.provider.sent)
+        await h.handle(connection, task_event)
+        await flush()
+        assert not h.task_updates.quiet() and not old.drained
+        assert sum(e['type'] == 'response.create' for e in h.provider.sent) == requested
+
+        await h.handle(connection, interrupt_event)
+        assert old.interrupted and not old.drained
+        assert any(e['type'] == 'audio.clear' and 'old' in e['response_ids'] for e in events)
+        assert h.store.data['calls']['c1']['status'] == 'succeeded'
+        assert h.store.data['calls']['c1']['result'] == {'task_id': 'job1'}
+        # A delayed drain must not convert cancellation into successful playback.
+        await h.handle(connection, {'type': 'playback.progress', 'response_id': 'old',
+                                    'played_samples': 2400, 'drained': True})
+        assert not old.drained
+        assert not any(e['type'] == 'playback.completed' and e['response_id'] == 'old' for e in events)
+        assert not any(row['kind'] == 'assistant_heard' for row in h.store.data['history'])
+        assert any(row['kind'] == 'assistant_interrupted' and row['response_id'] == 'old'
+                   for row in h.store.data['history'])
+
+        if interrupt_event['type'] == 'input.begin':
+            await flush()
+            assert h.input_open and h.task_updates.pending
+            assert sum(e['type'] == 'response.create' for e in h.provider.sent) == requested
+            await h.handle(connection, {'type': 'input.commit'})  # Release an empty button press.
+        # Advance only the guard's origin; use a real duplicate report to wake the worker.
+        h.turn_started_at = time.monotonic() - 1
+        await h.handle(connection, task_event)
+        await asyncio.wait_for(asyncio.shield(h.task_updates.worker), 1)
+        assert sum(e['type'] == 'response.create' for e in h.provider.sent) == requested + 1
+        assert not h.task_updates.pending
+
+        await response(h, 'announcement')
+        await model(h, {'type': 'response.audio_transcript.done', 'response_id': 'announcement',
+                        'transcript': 'synthetic task complete'})
+        await audio(h, 'announcement')
+        await done(h, 'announcement')
+        await h.handle(connection, {'type': 'playback.progress', 'response_id': 'announcement',
+                                    'played_samples': 2400, 'drained': True})
+        assert h.responses['announcement'].drained
+        assert any(row['kind'] == 'assistant_heard' and row['response_id'] == 'announcement'
+                   for row in h.store.data['history'])
+        # Future tasks must also be free of the cancelled response's impossible drain.
+        h.store.data['calls']['c2'] = {'status': 'succeeded', 'page_id': 'demo',
+                                      'result': {'task_id': 'job2'}}
+        h.turn_started_at = time.monotonic() - 1
+        await h.handle(connection, {**task_event, 'source_call_id': 'c2', 'task_id': 'job2'})
+        await asyncio.wait_for(asyncio.shield(h.task_updates.worker), 1)
+        assert sum(e['type'] == 'response.create' for e in h.provider.sent) == requested + 2
+        assert not h.task_updates.pending
     finally:
         await h.stop()
 

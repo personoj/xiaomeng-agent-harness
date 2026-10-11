@@ -435,7 +435,9 @@ class Harness:
         ids = []
         cancel = False
         for response in self.responses.values():
-            outstanding = not response.done or response.played_samples < response.generated_samples
+            # A full sample count can precede audio.end. A client that clears it
+            # will never drain it, so cancel pending playback until drain is confirmed.
+            outstanding = not response.done or (response.generated_samples > 0 and not response.drained)
             if response.interrupted or not outstanding:
                 continue
             response.interrupted = True

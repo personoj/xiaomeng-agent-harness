@@ -8,6 +8,8 @@ Task result announcements retain `task_sources` through response generation and 
 
 The completion-notification worker is event-driven. It retains the existing 500 ms quiet guard, waits for explicit playback drain, gives new speech priority, deduplicates task facts and does not start a stopped model session.
 
+Interruption treats generated audio as outstanding until an explicit drain receipt, even after the full sample count is reported. A client may clear playback before receiving a delayed `audio.end`, so cancelled responses must not require a future drain to release task notifications. Cancellation does not mark playback complete, record the answer as heard, or stop accepted page jobs.
+
 The page SDK's `execution.isCurrent()` checks revision, user turn, transport generation, session-stop generation and response cancellation. Host actions must recheck immediately before any mutation after awaited reads/decisions. Deploy this SDK together with the workshop controller's post-await checks. A voice interruption does not stop already-submitted mechanical work; late outcomes remain durable, without overwriting newer context or being sent through an unrelated replacement socket.
 
 Offline checks (from this repository):

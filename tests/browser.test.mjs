@@ -39,6 +39,21 @@ test('interrupt reports actually played samples and blocks late frames',async()=
   await c.receive(chunk('r1',2));assert.equal(nodes.length,1);
 });
 
+test('interrupt after all samples play cannot drain a delayed audio.end',async()=>{
+  const {c,sent,nodes}=runtime();await c.receive(chunk());
+  c.audio.currentTime=1;nodes[0].onended();
+  const progress={type:'playback.progress',response_id:'r1',played_samples:2400,drained:false};
+  assert.deepEqual(sent,[progress]);
+  // Generation can be done at Harness while its end marker is still in transit.
+  c.interrupt();
+  assert.deepEqual(sent,[progress,progress,{type:'interrupt'}]);
+  assert.equal(c.playing.has('r1'),false);
+  await c.receive({type:'audio.end',response_id:'r1'});
+  await c.receive(chunk('r1',2));c.reportProgress();
+  assert.equal(sent.length,3);assert.equal(nodes.length,1);
+  assert.equal(sent.some(event=>event.drained),false);
+});
+
 test('duplicate audio sequence is not played twice',async()=>{
   const {c,nodes}=runtime();await c.receive(chunk());await c.receive(chunk());assert.equal(nodes.length,1);
 });
