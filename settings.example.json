@@ -1,0 +1,7 @@
+{
+  "model": "qwen-audio-3.1-realtime-plus",
+  "voice": "longanqian_v3.1",
+  "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+  "turn_detection": "smart_turn",
+  "api_key_file": ""
+}

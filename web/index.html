@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>小萌 · 语音工作台</title><link rel="icon" href="/static/xiaoyun-avatar.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css"></head>
+<body>
+<main class="app-shell">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="小萌语音工作台"><img src="/static/xiaoyun-avatar.svg" alt=""><strong>小萌</strong><span class="brand-divider"></span><span class="brand-caption">语音工作台</span></a>
+    <div class="header-actions"><span id="local-status" class="connection-label"><i></i><span>连接本地服务…</span></span><span class="header-divider"></span><button id="settings" class="icon-button" aria-label="设置" data-icon="gear"></button></div>
+  </header>
+  <div class="workspace">
+    <section class="character-panel panel" aria-label="小萌语音助手">
+      <div class="character-content">
+        <button id="character-stage" class="character-stage" aria-label="小萌；说话时点击打断" title="说话时点击小萌可打断"><svg id="xiaoyun" role="img" aria-label="小萌形象"></svg><span class="character-shadow"></span></button>
+        <h1>小萌</h1>
+        <div class="voice-status" id="voice-status"><span data-icon="wave"></span><span id="state">等待与你对话</span></div>
+        <div id="waveform" class="waveform" aria-hidden="true"></div>
+        <div class="voice-actions"><button id="mic" class="button primary"><span data-icon="mic"></span><span id="mic-label">开启语音</span></button><button id="end-session" class="button secondary" disabled><span data-icon="stop"></span><span>结束会话</span></button></div>
+        <p id="voice-hint" class="voice-hint">开启麦克风，随时与小萌交流</p>
+      </div>
+    </section>
+    <div class="right-column">
+      <section class="conversation-panel panel" aria-label="当前对话">
+        <div class="conversation-header"><div><h2>当前对话</h2><p>实时语音与工具协作</p></div><button id="clear-chat" class="clear-button" title="清空屏幕显示，会话记忆仍保留"><span data-icon="trash"></span>清空对话</button></div>
+        <div id="transcripts" class="transcripts" role="log" aria-label="对话记录" aria-live="polite">
+          <div id="empty-state" class="empty-state"><img src="/static/xiaoyun-avatar.svg" alt=""><h3>小萌准备好了</h3><p>说出你的想法，我们从这里开始。</p></div>
+        </div>
+        <form id="text-form" class="composer"><div class="input-wrap"><input id="text" aria-label="消息" placeholder="输入消息，或直接与小萌说话…" autocomplete="off"><button id="interrupt" type="button" class="interrupt-button" title="打断当前回答" aria-label="打断当前回答" hidden><span data-icon="stop"></span></button></div><button id="send" class="send-button" type="submit" aria-label="发送消息" disabled><span data-icon="send"></span></button></form>
+      </section>
+      <nav class="utility-bar panel" aria-label="工作台工具">
+        <button id="open-tools"><span data-icon="layers"></span><span>工具与上下文</span><span id="tool-count" class="tool-count" hidden></span><span class="utility-arrow" data-icon="chevron"></span></button>
+        <button id="open-events"><span data-icon="clock"></span><span>运行记录</span><span class="utility-arrow" data-icon="chevron"></span></button>
+        <button id="open-model"><span data-icon="wave"></span><span>模型：<b>Qwen Audio</b></span><span class="utility-arrow" data-icon="chevron"></span></button>
+      </nav>
+    </div>
+  </div>
+</main>
+<div id="toast" class="toast" role="status" hidden></div>
+<dialog id="details" class="details-dialog"><div class="dialog-header"><h2 id="details-title">工具与上下文</h2><button id="close-details" class="icon-button" aria-label="关闭" data-icon="close"></button></div>
+  <section id="tools-content" class="detail-content" hidden>
+    <div class="integration-state"><span data-icon="plug"></span><div><strong id="frontend-status">尚未接入前端</strong><p id="frontend-description">前端连接后，这里会展示它提供的工具和上下文。</p></div></div>
+    <div class="session-pair"><span>会话 ID</span><code id="session-id">开始对话后生成</code><button id="copy-session" class="icon-button" aria-label="复制会话 ID" data-icon="copy"></button></div>
+    <h3>可用工具 <small id="tools-summary"></small></h3><div id="tool-list" class="tool-list"></div><h3>当前上下文 <small id="context-revision"></small></h3><pre id="context" class="code-panel">{}</pre>
+    <p class="detail-note">使用统一 SDK 接入 React、Vue 或普通 HTML 页面。业务工具由接入的前端提供。</p>
+  </section>
+  <section id="events-content" class="detail-content" hidden><div class="events-heading"><span>会话与工具执行事件</span><button id="clear-log" class="text-button">清空显示</button></div><pre id="events" class="code-panel events-panel">等待会话开始…</pre></section>
+  <section id="model-content" class="detail-content" hidden><dl class="settings-list"><div><dt>语音模型</dt><dd id="model">读取配置中…</dd></div><div><dt>音色</dt><dd id="voice">—</dd></div><div><dt>轮次检测</dt><dd id="turn-detection">—</dd></div><div><dt>最近首音频</dt><dd id="latency">—</dd></div><div><dt>工具调用</dt><dd id="calls">0 次</dd></div><div><dt>会话 ID</dt><dd id="settings-session">尚未开始</dd></div></dl><p class="detail-note">云端模型配置从本地服务读取。密钥始终保留在后端。</p><button id="new-session" class="button secondary">开始新会话</button><p class="detail-note">新会话拥有独立记忆，已接入的前端需要连接新的会话 ID。</p></section>
+</dialog>
+<script type="module" src="/static/app.js"></script>
+</body></html>

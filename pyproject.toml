@@ -1,0 +1,21 @@
+[project]
+name = "xiaoyun-realtime"
+version = "0.1.0"
+description = "Speech-native Agent harness with Qwen Realtime, frontend tools and ESP32 audio"
+requires-python = ">=3.11"
+dependencies = ["fastapi", "uvicorn", "websockets>=14", "jsonschema", "httpx"]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["xiaoyun*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

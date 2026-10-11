@@ -1,0 +1,35 @@
+.env
+.env.*
+!.env.example
+.local/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+dist/
+node_modules/
+build/
+# Local coordination and human conversation records are not source releases.
+/AGENTS.md
+/docs/project-discussion.md
+/docs/esp32-runtime-handoff.md
+/docs/validation.md
+*.pem
+*.key
+
+
+/docs/design/
+
+# Public release excludes all local credentials and personal recordings.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.local/
+/AGENTS.md
+!/AGENTS.md
+/docs/project-discussion.md
+
+/web/vendor/xiaoyun-engine.js
