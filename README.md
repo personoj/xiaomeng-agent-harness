@@ -69,7 +69,7 @@ ESP32 固件与 USB 桥接也是独立项目。当前终端已实现“你好小
 .\scripts\test.ps1
 ```
 
-或者在项目虚拟环境中运行 `python -m pytest`，再运行 `node --test tests/browser.test.mjs`。当前回归覆盖会话目录的只读行为、设备同步切换、工具调用、异步完成通知、转写关联、打断及实际播放进度。
+或者在项目虚拟环境中运行 `python -m pytest`，再运行 `npm test`。当前回归覆盖会话目录的只读行为、设备同步切换、工具调用、异步完成通知、转写关联、打断及实际播放进度。
 
 `scripts/probe_qwen.py`、`scripts/live_smoke.py`、`scripts/live_stream_check.py` 可进行真实 API 验证，会产生正常模型费用；结果只保存在忽略目录 `.local/`。这些脚本不能替代设备真人声学验收。
 

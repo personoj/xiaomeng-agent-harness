@@ -10,6 +10,6 @@ Push-Location $projectDirectory
 try {
     & $pythonExecutable -m pytest -q --basetemp=$runDirectory --tb=short
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    node --test tests/browser.test.mjs
+    node --test tests/browser.test.mjs tests/frontend.test.mjs
     exit $LASTEXITCODE
 } finally { Pop-Location }

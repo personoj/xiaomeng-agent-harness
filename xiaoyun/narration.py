@@ -41,6 +41,20 @@ class Narration:
         self.current: PreparedNarration | None = None
         self.cancelled_calls = set()
 
+    def reset_cancellations(self):
+        # Old turns/session responses cannot prepare or continue. Retain only
+        # this scope's call IDs, bounded by Harness's per-turn tool budget.
+        self.cancelled_calls.clear()
+
+    def _owns_call(self, connection, call_id):
+        h = self.h
+        call = h.store.data["calls"].get(call_id)
+        response = h.responses.get(call.get("response_id")) if call else None
+        return bool(h.provider and h.channels.get("page", (None,))[0] == connection
+                    and call and call.get("connection") == connection
+                    and call.get("page_id") == h.page_id and call.get("turn") == h.turn
+                    and response and not response.interrupted and call_id in response.calls)
+
     async def prepare(self, connection, event):
         """A rejection is correlated for the SDK, without echoing text/PCM."""
         narration_id = event.get("narration_id")
@@ -95,12 +109,12 @@ class Narration:
             await self.cancel("tool_not_accepted")
 
     async def consume(self, source_response):
-        if source_response.calls & self.cancelled_calls:
-            return True  # A cancelled page recording must not trigger a model reread.
         item = self.current
         if (not item or not item.accepted or item.call_id not in source_response.calls
                 or item.turn != self.h.turn or source_response.interrupted):
-            return False
+            # Cancelled narration must not trigger a model reread, but it must
+            # not swallow another call's result or a newer accepted narration.
+            return bool(source_response.calls) and source_response.calls <= self.cancelled_calls
         item.committed = True
         # Reserve a response while waiting for previous speech to drain. Other
         # task notifications must see an unfinished response and stay queued.
@@ -169,12 +183,34 @@ class Narration:
             await self.pump()
 
     async def cancel_from_page(self, connection, event):
+        h = self.h
+        nid, call_id = event.get("narration_id"), event.get("source_call_id")
+        if not isinstance(nid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", nid):
+            raise ValueError("invalid_narration_id")
+        source_bound = "source_call_id" in event
+        if source_bound and (not isinstance(call_id, str) or not call_id):
+            raise ValueError("invalid_narration_call")
         item = self.current
-        if not item or item.id != event.get("narration_id"):
+        if item and item.id == nid:
+            if item.connection != connection:
+                raise ValueError("narration_not_owned_by_page")
+            if source_bound and item.call_id != call_id:
+                return
+            await self.cancel("page_cancelled")
             return
-        if item.connection != connection:
-            raise ValueError("narration_not_owned_by_page")
-        await self.cancel("page_cancelled")
+        # Legacy ID-only cancellation still applies to prepared/playing audio.
+        # Before prepare there is no PCM owner yet: authenticate the source
+        # call instead, and retire only that intent without clearing any audio.
+        if not source_bound or not self._owns_call(connection, call_id):
+            return
+        if item and item.call_id == call_id:  # A different ID is not this recording.
+            return
+        call = h.store.data["calls"][call_id]
+        if call.get("status") != "dispatched":
+            return
+        self.cancelled_calls.add(call_id)
+        await h.emit({"type": "narration.stopped", "narration_id": nid,
+                      "source_call_id": call_id, "response_id": None, "reason": "page_cancelled"}, "page")
 
     async def cancel(self, reason):
         h, item = self.h, self.current
@@ -190,6 +226,6 @@ class Narration:
             await h.emit({"type": "audio.clear", "response_ids": [response.id], "reason": reason}, "audio")
             await h._activity("output", 0, response.id)
         await h.emit({"type": "narration.stopped", "narration_id": item.id,
-                      "response_id": item.response_id, "reason": reason}, "page")
+                      "source_call_id": item.call_id, "response_id": item.response_id, "reason": reason}, "page")
         if reason == "page_cancelled" and h.provider:
-            await h.set_state("listening")
+            await h._settle_idle()

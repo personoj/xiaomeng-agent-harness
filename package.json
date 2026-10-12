@@ -1,1 +1,1 @@
-{"name":"xiaoyun-realtime-browser","private":true,"type":"module","scripts":{"test":"node --test tests/browser.test.mjs"}}
+{"name":"xiaoyun-realtime-browser","private":true,"type":"module","scripts":{"test":"node --test tests/browser.test.mjs tests/frontend.test.mjs"}}
