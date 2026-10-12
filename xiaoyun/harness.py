@@ -210,6 +210,7 @@ class Harness:
             self.manual_commits.clear()
             self.manual_pending_turn = None
             self.responses.clear()
+            self.narration.reset_cancellations()
             self.speech_inputs = SpeechInputs()
             self.expected_turns.clear()
             self.expected_task_sources.clear()
@@ -408,6 +409,7 @@ class Harness:
         self.manual_pending_turn = None
         await self._interrupt(reason)
         self.turn += 1
+        self.narration.reset_cancellations()
         self.store.data["turn"] = self.turn
         self.store.save()
         self.turn_started_at = time.monotonic()

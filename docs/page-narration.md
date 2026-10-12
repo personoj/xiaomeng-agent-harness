@@ -21,7 +21,11 @@ return {accepted: true, narration_id: narrationId};
 
 准备成功不等于开始播放，更不代表用户听完。工具需返回上例的两个字段。准备后返回失败、缺少匹配ID或没有 `accepted:true`，会撤销这份讲解。服务仍把小型工具回执送给模型，但不再请求模型复述讲稿。
 
-`bridge.cancelNarration(narrationId)` 取消当前页面自己的对应讲解；不推进对话轮次，不调用场景或机器人暂停。页面离开时调用 `bridge.disconnect()` 也会使服务撤销未结束的配音。
+`bridge.cancelNarration(narrationId, sourceCallId)` 取消当前页面该工具调用的讲解意图。请在开始异步加载音频前创建ID，并在停止、替换或取消加载时传入同一个工具调用ID：即使 `prepareNarration` 尚未发送，服务也会阻止迟到的准备和受理回执重新开播。SDK立即拒绝对应的准备Promise；不推进对话轮次、不清除别的讲解声音、不调用场景或机器人暂停。
+
+服务只为当前页面连接、页面身份、当前轮次和未被打断的源响应下仍为 `dispatched` 的调用登记提前取消。取消记录按源调用去重，受每轮工具数量限制，并在新轮次或模型会话重启时清除；旧轮次、旧连接和旧会话仍由原有归属校验拒绝。已有准备/播放中的讲解须同时匹配讲解ID和给定的源调用ID；不匹配的迟到取消不能停止替代讲解。
+
+旧的 `bridge.cancelNarration(narrationId)` 调用仍可取消已准备或正在播放的对应讲解；尚未准备时应使用双参数形式。页面离开时调用 `bridge.disconnect()` 也会使服务撤销未结束的配音。工作坊调用方、Harness的 `/static/frontend.js` 和Python服务应一并更新。
 
 ## 页面事件
 
@@ -30,7 +34,7 @@ return {accepted: true, narration_id: narrationId};
 | `narration.prepared` | `narration_id, source_call_id, duration, duplicate` | PCM已收妥；SDK的prepare Promise据此完成 |
 | `narration.started` | `narration_id, response_id, duration` | 等待前一段声音真正播空后，开始向现有音频端发送 |
 | `narration.progress` | `narration_id, response_id, played_seconds, total_seconds, completed` | 由音频端真实的已播样本回执换算；页面动画应以此为设备讲解时钟 |
-| `narration.stopped` | `narration_id, response_id, reason` | 用户打断、页面取消、会话结束或通道离开；不自动续播 |
+| `narration.stopped` | `narration_id, source_call_id, response_id, reason` | 用户打断、页面取消、会话结束或通道离开；不自动续播 |
 | `narration.failed` | `narration_id, code` | 准备被拒绝；SDK的prepare Promise拒绝 |
 
 事件还带有通用的 `session_id` 和 `turn`。`response_id` 在尚未受理的准备取消时可为null。主页面只处理属于当前 `narration_id` 的事件，忽略上次讲解迟到的进度。
@@ -49,6 +53,6 @@ return {accepted: true, narration_id: narrationId};
 
 ## 检查范围
 
-新增六个协议测试覆盖：角色/调用/页面归属与载荷限制、前序真实drain与发送窗口、重复回执与重复准备、BOOT新轮中断、准备后页面取消及迟到回执、页面断线。既有PTT/音量回执10项、普通工具及异步通知26项回归通过，共42项。
+本轮离线测试覆盖：角色/调用/页面归属与载荷限制、前序真实drain与发送窗口、重复回执与重复准备、BOOT新轮中断、准备前/准备后取消与迟到受理、不同源调用和替代讲解隔离、页面重连、取消记录去重及生命周期清理。JavaScript测试另覆盖SDK准备Promise、同步取消、超时、迟到事件和同socket停止。运行项目虚拟环境中的 `python -m pytest` 及 `npm test` 可执行全部回归。
 
-这些测试使用FakeProvider和可控播放回执，验证生命周期和数据流；没有向实际ESP32发声，也不能替代真实设备听感与同步验收。前端SDK通过JavaScript语法检查；主页面的动作注册和原理动画接入由调用方实现。
+这些测试使用FakeProvider和可控播放回执，验证生命周期和数据流；没有向实际ESP32发声，也不能替代真实设备听感与同步验收。主页面的动作注册、异步加载取消和原理动画接入由调用方实现，并须在每个异步等待后重新校验调用意图。

@@ -146,3 +146,126 @@ async def test_disconnect_drops_pcm_and_fails_pending_delivery(connected):
     assert h.responses[rid].interrupted
     assert any(e["type"] == "audio.clear" and rid in e["response_ids"] for e in audio_events)
     assert any(e["type"] == "narration.stopped" and e["reason"] == "page_disconnected" for e in events)
+
+
+async def test_source_cancel_before_prepare_rejects_late_pcm_and_acceptance(connected):
+    h, page, _, events, audio_events = connected
+    turn = h.turn
+    cancellation = {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"}
+    await h.handle(page, cancellation)
+    await h.handle(page, cancellation)
+    assert h.narration.cancelled_calls == {"c1"}
+    assert events[-1]["type"] == "narration.stopped"
+    assert events[-1]["source_call_id"] == "c1" and events[-1]["response_id"] is None
+    await h.handle(page, prepare())
+    assert events[-1]["code"] == "narration_call_cancelled"
+    await accept(h, page)
+    assert h.turn == turn and h.narration.current is None
+    assert not any(e["type"] == "narration.started" for e in events)
+    assert not any(e["type"] in ("audio.delta", "audio.clear") for e in audio_events)
+    assert not any(e["type"] == "response.create" for e in h.provider.sent)
+
+
+async def test_source_cancel_between_prepare_and_accepted_result(connected):
+    h, page, _, events, audio_events = connected
+    await h.handle(page, prepare())
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    await accept(h, page)
+    assert h.narration.current is None and h.narration.cancelled_calls == {"c1"}
+    assert not any(e["type"] == "narration.started" for e in events)
+    assert not any(e["type"] in ("audio.delta", "audio.clear") for e in audio_events)
+    assert not any(e["type"] == "response.create" for e in h.provider.sent)
+
+
+@pytest.mark.parametrize("invalid", ["connection", "page", "turn", "response", "interrupted", "membership", "status", "unknown"])
+async def test_pre_prepare_cancel_requires_a_live_owned_dispatched_source(connected, invalid):
+    h, page, _, events, _ = connected
+    source = h.store.data["calls"]["c1"]
+    if invalid == "connection": source["connection"] = "previous-page-connection"
+    if invalid == "page": source["page_id"] = "another-page"
+    if invalid == "turn": source["turn"] -= 1
+    if invalid == "response": source["response_id"] = "missing"
+    if invalid == "interrupted": h.responses["r1"].interrupted = True
+    if invalid == "membership": h.responses["r1"].calls.clear()
+    if invalid == "status": source["status"] = "succeeded"
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1",
+                          "source_call_id": "unknown" if invalid == "unknown" else "c1"})
+    assert not h.narration.cancelled_calls
+    assert not any(e["type"] == "narration.stopped" for e in events)
+
+
+@pytest.mark.parametrize("fields,code", [
+    ({"narration_id": "x" * 129}, "invalid_narration_id"),
+    ({"narration_id": []}, "invalid_narration_id"),
+    ({"source_call_id": []}, "invalid_narration_call"),
+    ({"source_call_id": ""}, "invalid_narration_call"),
+    ({"source_call_id": None}, "invalid_narration_call"),
+])
+async def test_source_cancellation_rejects_invalid_identifiers(connected, fields, code):
+    h, page, _, _, _ = connected
+    with pytest.raises(ValueError, match=code):
+        await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1", **fields})
+    assert not h.narration.cancelled_calls
+
+
+async def test_stale_cancellation_does_not_stop_newer_narration_in_same_response(connected):
+    h, page, _, events, audio_events = connected
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    await call(h, "explain", cid="c2")
+    await flush()
+    await h.handle(page, prepare(source_call_id="c2", narration_id="lesson_2"))
+    await h.handle(page, {"type": "tool.result", "call_id": "c1", "result": {"error": "cancelled"}})
+    await h.handle(page, {"type": "tool.result", "call_id": "c2", "result": {"accepted": True, "narration_id": "lesson_2"}})
+    await done(h)
+    await flush()
+    item = h.narration.current
+    assert item and item.id == "lesson_2" and item.started
+    before = len(audio_events)
+    for nid, call_id in [("lesson_1", "c1"), ("lesson_2", "c1"), ("wrong_id", "c2")]:
+        await h.handle(page, {"type": "narration.cancel", "narration_id": nid, "source_call_id": call_id})
+    assert h.narration.current is item
+    assert not h.responses[item.response_id].interrupted
+    assert not any(e["type"] == "audio.clear" for e in audio_events[before:])
+    assert h.narration.cancelled_calls == {"c1"}
+    assert not any(e["type"] == "response.create" for e in h.provider.sent)
+
+
+async def test_cancelled_narration_does_not_swallow_another_tools_continuation(connected):
+    h, page, _, _, _ = connected
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    await call(h, "explain", cid="c2")
+    await flush()
+    for call_id, result in [("c1", {"error": "cancelled"}), ("c2", {"ok": True})]:
+        await h.handle(page, {"type": "tool.result", "call_id": call_id, "result": result})
+    await done(h)
+    await flush()
+    assert sum(e["type"] == "response.create" for e in h.provider.sent) == 1
+
+
+@pytest.mark.parametrize("transition", ["new_turn", "restart"])
+async def test_cancellation_tombstones_expire_with_the_source_scope(connected, transition):
+    h, page, terminal, events, _ = connected
+    for index in range(100):
+        await h.handle(page, {"type": "narration.cancel", "narration_id": f"cancel_{index}", "source_call_id": "c1"})
+    assert h.narration.cancelled_calls == {"c1"}  # Store calls, not arbitrary narration IDs.
+    if transition == "new_turn":
+        await h.handle(terminal, {"type": "input.begin"})
+    else:
+        await h.stop()
+        await h.start()
+    assert not h.narration.cancelled_calls
+    await h.handle(page, prepare())
+    assert events[-1]["code"] == "narration_call_not_current"
+
+
+async def test_replacement_page_cannot_retire_previous_connection_call(connected):
+    h, page, _, _, _ = connected
+    await h.detach(page)
+    events = []
+    async def sink(event): events.append(event)
+    replacement = await h.attach("page", sink)
+    await h.handle(replacement, {"type": "context.update", "page_id": "lesson", "context": {}})
+    await h.handle(replacement, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    assert not h.narration.cancelled_calls
+    with pytest.raises(ValueError, match="connection_expired"):
+        await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
