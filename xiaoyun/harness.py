@@ -467,6 +467,18 @@ class Harness:
         response.recorded = True
         self.store.history("assistant_interrupted", "回答被打断。未完成的文字不作为用户已听到的内容。", response_id=response.id, played_ms=response.played_samples / 24, reason=reason)
 
+    async def _settle_idle(self):
+        # Called under the session lock after tool/narration or playback cleanup.
+        # A cancelled continuation has no future response to return us to listening.
+        if (not self.provider or "audio" not in self.channels or self.narration.current
+                or self.speech_active or self.input_open or self.manual_buffered
+                or self.manual_pending_turn is not None or self.expected_turns
+                or any(c["status"] in ("running", "dispatched") for c in self.store.data["calls"].values())
+                or any(not r.done or (not r.interrupted and r.generated_samples > 0 and not r.drained)
+                       for r in self.responses.values())):
+            return
+        await self.set_state("listening")
+
     async def _playback(self, event):
         response = self.responses.get(event.get("response_id"))
         if not response:
@@ -498,9 +510,9 @@ class Harness:
                 await self._refresh()
             await self.emit({"type": "playback.completed", "response_id": response.id,
                              "turn": response.turn, "played_ms": played / 24})
-            if response.turn == self.turn and not self.expected_turns and not any(c["status"] in ("running", "dispatched") for c in self.store.data["calls"].values()) and not any(not r.done or (not r.interrupted and r.played_samples < r.generated_samples) for r in self.responses.values()):
-                await self.set_state("listening")
         await self.narration.playback(response, completed)
+        if completed and response.turn == self.turn:
+            await self._settle_idle()
 
     async def _model(self, event):
         kind = event.get("type", "")
@@ -782,5 +794,7 @@ class Harness:
             return
         response.continued = True
         if response.turn == self.turn and not response.interrupted and self.provider:
-            if not await self.narration.consume(response):
+            if await self.narration.consume(response):
+                await self._settle_idle()
+            else:
                 await self._request_response(response.turn, task_sources=response.task_sources)

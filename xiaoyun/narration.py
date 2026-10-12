@@ -228,4 +228,4 @@ class Narration:
         await h.emit({"type": "narration.stopped", "narration_id": item.id,
                       "source_call_id": item.call_id, "response_id": item.response_id, "reason": reason}, "page")
         if reason == "page_cancelled" and h.provider:
-            await h.set_state("listening")
+            await h._settle_idle()

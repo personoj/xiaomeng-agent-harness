@@ -7,7 +7,7 @@ from xiaoyun.config import Settings
 from xiaoyun.harness import Harness
 from xiaoyun.memory import SessionStore
 from xiaoyun.narration import AHEAD_SAMPLES, MAX_SAMPLES
-from test_harness import FakeProvider, response, call, done, audio, flush
+from test_harness import FakeProvider, response, call, done, audio, flush, model
 
 
 @pytest.fixture
@@ -83,6 +83,7 @@ async def test_waits_for_real_prefix_drain_and_progress_limits_the_send_window(c
     await h.handle(terminal, {"type": "playback.progress", "response_id": rid, "played_samples": 48000, "drained": True})
     assert h.store.data["history"][-1]["kind"] == "assistant_heard"
     assert h.narration.current is None and rec.drained
+    assert h.state == "listening"
     assert [e for e in events if e["type"] == "narration.progress"][-1]["completed"]
     assert not any(e["type"] == "response.create" for e in h.provider.sent)
     assert not any("pcm" in e or e["type"] == "narration.progress" for e in h.trace)
@@ -164,6 +165,116 @@ async def test_source_cancel_before_prepare_rejects_late_pcm_and_acceptance(conn
     assert not any(e["type"] == "narration.started" for e in events)
     assert not any(e["type"] in ("audio.delta", "audio.clear") for e in audio_events)
     assert not any(e["type"] == "response.create" for e in h.provider.sent)
+
+
+@pytest.mark.parametrize("result", [
+    {"error": "narration_cancelled"},
+    {"accepted": True, "narration_id": "lesson_1"},
+], ids=["cancelled-result", "late-acceptance"])
+async def test_cancel_before_prepare_settles_after_source_already_drained(connected, result):
+    h, page, terminal, events, audio_events = connected
+    await done(h)
+    await h.handle(terminal, {"type": "playback.progress", "response_id": "r1",
+                             "played_samples": 0, "drained": True})
+    assert h.state == "working"  # The page tool is still loading its recording.
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    assert h.state == "working" and h.store.data["calls"]["c1"]["status"] == "dispatched"
+    await h.handle(page, {"type": "tool.result", "call_id": "c1", "result": result})
+    await flush()
+    assert h.state == "listening" and not h.expected_turns
+    assert h.narration.current is None and h.narration.cancelled_calls == {"c1"}
+    assert not any(e["type"] == "response.create" for e in h.provider.sent)
+    assert not any(e["type"] == "narration.started" for e in events)
+    assert not any(e["type"] in ("audio.delta", "audio.clear") for e in audio_events)
+    assert not any(row["kind"] == "assistant_heard" for row in h.store.data["history"])
+
+
+async def test_cancel_before_prepare_preserves_parallel_tool_and_its_continuation(connected):
+    h, page, terminal, _, _ = connected
+    await call(h, "explain", cid="c2")
+    await flush()
+    await done(h)
+    await h.handle(terminal, {"type": "playback.progress", "response_id": "r1",
+                             "played_samples": 0, "drained": True})
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    await h.handle(page, {"type": "tool.result", "call_id": "c1", "result": {"error": "narration_cancelled"}})
+    await flush()
+    assert h.state == "working" and h.store.data["calls"]["c2"]["status"] == "dispatched"
+    assert not h.expected_turns
+    await h.handle(page, {"type": "tool.result", "call_id": "c2", "result": {"ok": True}})
+    await flush()
+    assert h.state == "working" and list(h.expected_turns) == [h.turn]
+    await response(h, "continuation")
+    await audio(h, "continuation")
+    await done(h, "continuation")
+    await h.handle(terminal, {"type": "playback.progress", "response_id": "continuation",
+                             "played_samples": 2400, "drained": True})
+    assert h.state == "listening"
+
+
+@pytest.mark.parametrize("prepared", [False, True], ids=["before-prepare", "after-prepare"])
+async def test_page_narration_cancel_waits_for_actual_prefix_drain(connected, prepared):
+    h, page, terminal, _, _ = connected
+    await model(h, {"type": "response.audio_transcript.done", "response_id": "r1", "transcript": "Synthetic prefix."})
+    await audio(h)
+    await done(h)
+    await h.handle(terminal, {"type": "playback.progress", "response_id": "r1", "played_samples": 2400})
+    if prepared:
+        await h.handle(page, prepare())
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    await h.handle(page, {"type": "tool.result", "call_id": "c1", "result": {"error": "narration_cancelled"}})
+    await flush()
+    assert h.state == "speaking" and not h.responses["r1"].drained
+    assert not any(row["kind"] == "assistant_heard" for row in h.store.data["history"])
+    await h.handle(terminal, {"type": "playback.progress", "response_id": "r1",
+                             "played_samples": 2400, "drained": True})
+    assert h.state == "listening"
+    heard = [row for row in h.store.data["history"] if row["kind"] == "assistant_heard"]
+    assert len(heard) == 1 and heard[0]["response_id"] == "r1"
+
+
+async def test_cancel_before_prepare_preserves_expected_response_and_other_audio(connected):
+    h, page, terminal, _, _ = connected
+    await done(h)
+    drained_source = {"type": "playback.progress", "response_id": "r1", "played_samples": 0, "drained": True}
+    await h.handle(terminal, drained_source)
+    async with h.lock:
+        await h._request_response(h.turn)
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    await h.handle(page, {"type": "tool.result", "call_id": "c1", "result": {"error": "narration_cancelled"}})
+    await flush()
+    assert h.state == "working" and list(h.expected_turns) == [h.turn]
+    await response(h, "other")
+    await audio(h, "other")
+    await done(h, "other")
+    await h.handle(terminal, {"type": "playback.progress", "response_id": "other", "played_samples": 2400})
+    # A duplicate receipt for the cancelled call's source must not mark another
+    # response idle merely because that response has reported its full sample count.
+    await h.handle(terminal, drained_source)
+    assert h.state == "speaking" and not h.responses["other"].drained
+    await h.handle(terminal, {"type": "playback.progress", "response_id": "other",
+                             "played_samples": 2400, "drained": True})
+    assert h.state == "listening"
+
+
+@pytest.mark.parametrize("input_phase", ["speech_active", "input_open", "manual_buffered", "manual_pending_turn"])
+async def test_cancel_before_prepare_does_not_override_input_collection(connected, input_phase):
+    h, page, terminal, _, _ = connected
+    await done(h)
+    drained_source = {"type": "playback.progress", "response_id": "r1", "played_samples": 0, "drained": True}
+    await h.handle(terminal, drained_source)
+    # Inject each input-collection phase without changing the source turn, so
+    # settlement itself must respect the input guard instead of an old-turn guard.
+    setattr(h, input_phase, h.turn if input_phase == "manual_pending_turn" else True)
+    await h.handle(page, {"type": "narration.cancel", "narration_id": "lesson_1", "source_call_id": "c1"})
+    await h.handle(page, {"type": "tool.result", "call_id": "c1", "result": {"error": "narration_cancelled"}})
+    await flush()
+    assert h.state == "working"
+    await h.handle(terminal, drained_source)
+    assert h.state == "working"
+    setattr(h, input_phase, None if input_phase == "manual_pending_turn" else False)
+    await h.handle(terminal, drained_source)
+    assert h.state == "listening"
 
 
 async def test_source_cancel_between_prepare_and_accepted_result(connected):
